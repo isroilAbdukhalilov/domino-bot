@@ -140,7 +140,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     token = os.environ.get("BOT_TOKEN")
     if not token:
+        env_keys = sorted(os.environ.keys())
+        logger.error("BOT_TOKEN not found. Available env var names: %s", env_keys)
         raise RuntimeError("BOT_TOKEN environment variable is not set")
+    else:
+        logger.info("BOT_TOKEN found, length=%d, starts_with=%s", len(token), token[:6])
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
