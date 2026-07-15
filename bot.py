@@ -56,25 +56,9 @@ def init_db():
         )
     """)
     conn.commit()
-
-    count = conn.execute("SELECT COUNT(*) AS c FROM listings").fetchone()["c"]
-    if count == 0 and os.path.exists(SEED_JSON_PATH):
-        logger.info("Seeding database from listings.json (historical export)...")
-        with open(SEED_JSON_PATH, "r", encoding="utf-8") as f:
-            seed = json.load(f)
-        for l in seed:
-            conn.execute("""
-                INSERT OR IGNORE INTO listings
-                (id, date, raw_text, type, district, rooms, floor, total_floors, area_m2, price, condition, phones, photo_file_ids)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                l.get("id"), l.get("date"), l.get("raw_text"), l.get("type"),
-                l.get("district"), l.get("rooms"), l.get("floor"), l.get("total_floors"),
-                l.get("area_m2"), l.get("price"), l.get("condition"), l.get("phones"), None
-            ))
-        conn.commit()
-        logger.info("Seeded %d historical listings.", len(seed))
     conn.close()
+    # NOTE: historical seed data intentionally removed. This bot only ever stores
+    # listings it captures directly from the channel (with original text + photos).
 
 
 def upsert_listing(record):
@@ -176,6 +160,16 @@ def parse_query(text: str):
             criteria["district"] = canonical
             break
 
+    # Anything left over (property names, streets, landmarks, ЖК names, etc.)
+    # becomes a free-text search against the original post content.
+    stripped = re.sub(r"\d+", " ", text_lower)
+    for kw in ["комнат", "комнаты", "комната", "этажность", "этаж", "до", "тыс", "у.е", "сум"]:
+        stripped = stripped.replace(kw, " ")
+    for alias in DISTRICT_ALIASES:
+        stripped = stripped.replace(alias, " ")
+    leftover = [w for w in re.findall(r"[а-яa-zё\-]+", stripped) if len(w) > 2]
+    criteria["free_text"] = leftover
+
     return criteria
 
 
@@ -183,18 +177,35 @@ def search_listings(criteria, limit=6):
     conn = get_conn()
     query = "SELECT * FROM listings WHERE 1=1"
     params = []
+    has_structured = False
     if criteria.get("rooms") is not None:
         query += " AND rooms = ?"
         params.append(criteria["rooms"])
+        has_structured = True
     if criteria.get("floor") is not None:
         query += " AND floor = ?"
         params.append(criteria["floor"])
+        has_structured = True
     if criteria.get("max_price") is not None:
         query += " AND price IS NOT NULL AND price <= ?"
         params.append(criteria["max_price"])
+        has_structured = True
     if criteria.get("district") is not None:
         query += " AND district = ?"
         params.append(criteria["district"])
+        has_structured = True
+
+    free_text = criteria.get("free_text") or []
+    if free_text:
+        for word in free_text:
+            query += " AND raw_text LIKE ? COLLATE NOCASE"
+            params.append(f"%{word}%")
+
+    if not has_structured and not free_text:
+        # nothing recognizable in the query at all - don't just dump recent listings
+        conn.close()
+        return []
+
     query += " ORDER BY date DESC LIMIT ?"
     params.append(limit)
 
