@@ -1,20 +1,23 @@
 import re
-from config import DISTRICT_ALIASES, DISTRICTS
+
+from config import DISTRICT_ALIASES
 
 
-def _find(pattern, text, cast=str):
+def find(pattern, text, cast=str):
     m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
 
     if not m:
         return None
 
+    value = m.group(1).strip()
+
     try:
-        return cast(m.group(1).strip())
+        return cast(value)
     except:
-        return m.group(1).strip()
+        return value
 
 
-def normalize_price(value):
+def clean_price(value):
 
     if value is None:
         return None
@@ -36,92 +39,14 @@ def extract_district(text):
         if alias in lower:
             return district
 
-    for district in DISTRICTS:
+    m = re.search(
+        r"([А-ЯЁа-яё\-\s]+район)",
+        text,
+        re.IGNORECASE
+    )
 
-        if district.lower() in lower:
-            return district
-
-    return None
-
-
-def extract_complex(text):
-
-    patterns = [
-
-        r"(?:ЖК|Ж/К)\s*[:\-]?\s*([^\n]+)",
-
-        r"(?:Комплекс)\s*[:\-]?\s*([^\n]+)",
-
-        r"(?:Жилой комплекс)\s*[:\-]?\s*([^\n]+)"
-
-    ]
-
-    for p in patterns:
-
-        value = _find(p, text)
-
-        if value:
-            return value
-
-    return None
-
-
-def extract_landmark(text):
-
-    patterns = [
-
-        r"(?:Ориентир)\s*[:\-]?\s*([^\n]+)",
-
-        r"(?:Ориентир:)\s*([^\n]+)"
-
-    ]
-
-    for p in patterns:
-
-        value = _find(p, text)
-
-        if value:
-            return value
-
-    return None
-
-
-def extract_metro(text):
-
-    patterns = [
-
-        r"(?:Метро)\s*[:\-]?\s*([^\n]+)",
-
-        r"(?:м\.)\s*([^\n]+)"
-
-    ]
-
-    for p in patterns:
-
-        value = _find(p, text)
-
-        if value:
-            return value
-
-    return None
-
-
-def extract_street(text):
-
-    patterns = [
-
-        r"(?:Улица)\s*[:\-]?\s*([^\n]+)",
-
-        r"(?:ул\.)\s*([^\n]+)"
-
-    ]
-
-    for p in patterns:
-
-        value = _find(p, text)
-
-        if value:
-            return value
+    if m:
+        return m.group(1).strip()
 
     return None
 
@@ -132,73 +57,111 @@ def parse_post(text):
 
     data["raw_text"] = text
 
-    first = text.strip().split("\n")
+    lines = [
+        i.strip()
+        for i in text.splitlines()
+        if i.strip()
+    ]
 
-    data["property_type"] = first[0] if first else ""
+    data["property_type"] = lines[0] if lines else ""
 
-    data["complex_name"] = extract_complex(text)
+    data["complex_name"] = find(
 
-    data["district"] = extract_district(text)
-
-    data["landmark"] = extract_landmark(text)
-
-    data["metro"] = extract_metro(text)
-
-    data["street"] = extract_street(text)
-
-    data["rooms"] = _find(
-
-        r"Комнат[а-я]*\s*[:\-]?\s*(\d+)",
-
-        text,
-
-        int
-
-    )
-
-    data["floor"] = _find(
-
-        r"(?<!Э)Этаж\s*[:\-]?\s*(\d+)",
-
-        text,
-
-        int
-
-    )
-
-    data["total_floors"] = _find(
-
-        r"Этажность\s*[:\-]?\s*(\d+)",
-
-        text,
-
-        int
-
-    )
-
-    data["area"] = _find(
-
-        r"(?:Площадь|Общая площадь)\s*[:\-]?\s*([\d.,]+)",
-
-        text,
-
-        float
-
-    )
-
-    price = _find(
-
-        r"Цена\s*[:\-]?\s*([^\n]+)",
+        r"ЖК[:\s]*([^\n]+)",
 
         text
 
     )
 
-    data["price"] = normalize_price(price)
+    data["district"] = extract_district(text)
 
-    data["condition"] = _find(
+    data["landmark"] = find(
 
-        r"Состояние\s*[:\-]?\s*([^\n]+)",
+        r"Ориентир[:\s]*([^\n]+)",
+
+        text
+
+    )
+
+    data["street"] = find(
+
+        r"Улица[:\s]*([^\n]+)",
+
+        text
+
+    )
+
+    data["metro"] = find(
+
+        r"Метро[:\s]*([^\n]+)",
+
+        text
+
+    )
+
+    data["rooms"] = find(
+
+        r"Комнат[:\s]*(\d+)",
+
+        text,
+
+        int
+
+    )
+
+    data["floor"] = find(
+
+        r"Этаж[:\s]*(\d+)",
+
+        text,
+
+        int
+
+    )
+
+    data["total_floors"] = find(
+
+        r"Этажность[:\s]*(\d+)",
+
+        text,
+
+        int
+
+    )
+
+    area = find(
+
+        r"Общая площадь[:\s]*([\d.,]+)",
+
+        text
+
+    )
+
+    if area:
+
+        area = area.replace(",", ".")
+
+        data["area"] = float(area)
+
+    else:
+
+        data["area"] = None
+
+    data["price"] = clean_price(
+
+        find(
+
+            r"Цена[:\s]*([^\n]+)",
+
+            text
+
+        )
+
+    )
+
+    data["condition"] = find(
+
+        r"Состояние[:\s]*([^\n]+)",
 
         text
 
@@ -212,6 +175,38 @@ def parse_post(text):
 
     )
 
-    data["phones"] = ",".join(sorted(set(phones)))
+    data["phones"] = ",".join(
+
+        sorted(set(phones))
+
+    )
+
+    data["with_furniture"] = (
+
+        "мебелью" in text.lower()
+
+    )
+
+    data["new_building"] = (
+
+        "новостройка" in text.lower()
+
+    )
+
+    data["direct_sale"] = (
+
+        "прямой" in text.lower()
+
+    )
+
+    rent = find(
+
+        r"С арендатором[:\s]*([^\n]+)",
+
+        text
+
+    )
+
+    data["tenant_income"] = rent
 
     return data
