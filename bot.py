@@ -315,12 +315,7 @@ def main():
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
-    from telegram.ext import TypeHandler
-
-app.add_handler(
-    TypeHandler(Update, handle_channel_post),
-    group=-1
-)
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_private_message))
 
     logger.info("Bot starting...")
