@@ -74,6 +74,17 @@ def init_db():
             added_date TEXT
         )
     """)
+
+    # Migration: older deployments used a schema without channel_id/uid.
+    # If we detect that old table shape, rebuild it fresh (safe: this bot
+    # never relies on data surviving that migration - it's only ever meant
+    # to hold live listings captured from channels going forward).
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(listings)").fetchall()}
+    if existing_cols and "channel_id" not in existing_cols:
+        logger.warning("Old listings schema detected (columns=%s) - rebuilding table.", existing_cols)
+        conn.execute("DROP TABLE listings")
+        conn.commit()
+
     conn.execute("""
         CREATE TABLE IF NOT EXISTS listings (
             uid TEXT PRIMARY KEY,
