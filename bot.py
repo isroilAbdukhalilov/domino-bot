@@ -16,15 +16,12 @@ logger = logging.getLogger(__name__)
 DB_PATH = os.environ.get("DB_PATH", "listings.db")
 MEDIA_GROUP_WAIT_SECONDS = 3
 
-# Maps both Cyrillic and Latin/transliterated spellings (Russian & Uzbek) to the
-# canonical Russian district name used in the original posts.
 DISTRICT_ALIASES = {
     "юнусабад": "Юнусабадский", "мирабад": "Мирабадский", "мирабд": "Мирабадский",
     "шайхантахур": "Шайхантахурский", "чиланзар": "Чиланзарский", "сергели": "Сергелийский",
     "яккасарай": "Яккасарайский", "мирзо улугбек": "Мирзо-Улугбекский",
     "мирзо-улугбек": "Мирзо-Улугбекский", "учтепа": "Учтепинский", "бектемир": "Бектемирский",
     "яшнабад": "Яшнабадский", "алмазар": "Алмазарский",
-    # transliterated / Latin variants
     "yunusabad": "Юнусабадский", "yunusobod": "Юнусабадский",
     "mirabad": "Мирабадский", "mirobod": "Мирабадский", "mira": "Мирабадский",
     "shayxontohur": "Шайхантахурский", "shaykhantahur": "Шайхантахурский",
@@ -41,9 +38,24 @@ DISTRICTS = list(dict.fromkeys(DISTRICT_ALIASES.values()))
 ROOM_PATTERN = re.compile(r"(\d+)\s*[-]?\s*(?:komnat\w*|xonali\w*|xona\w*|room\w*|комнат\w*)", re.IGNORECASE)
 FLOOR_PATTERN = re.compile(r"(\d+)\s*[-]?\s*(?:etaj\w*|qavat\w*|floor\w*|этаж(?!ность))", re.IGNORECASE)
 
-# in-memory per-user channel selection (resets on bot restart - acceptable for now)
-user_channel_choice = {}
-pending_groups = {}  # (channel_id, media_group_id) -> {...}
+# Guided-search field definitions
+FIELD_LABELS = {
+    "rayon": "📍 Район",
+    "jk": "🏘 ЖК",
+    "komnata": "🚪 Комнат",
+    "etaj": "🏢 Этаж",
+    "etajnost": "🏗 Этажность",
+    "ploshad": "📐 Площадь (до, м²)",
+    "cena": "💰 Цена (до)",
+    "orientir": "📌 Ориентир",
+    "sostoyanie": "🔧 Состояние",
+}
+NUMERIC_FIELDS = {"komnata", "etaj", "etajnost", "ploshad", "cena"}
+
+user_channel_choice = {}          # user_id -> chat_id or "ALL"
+user_search_criteria = {}         # user_id -> {field: value}
+user_awaiting_field = {}          # user_id -> field name currently being entered
+pending_groups = {}                # (channel_id, media_group_id) -> {...}
 
 
 # ---------- Database ----------
@@ -160,12 +172,14 @@ def parse_fields(text: str):
     fields["condition"] = find(r"Состояние\s*[:\-]?\s*(.+)")
 
     district_found = None
+    text_normalized = text.replace("-", " ")
     for d in DISTRICTS:
-        if d in text:
+        d_normalized = d.replace("-", " ")
+        if d_normalized in text_normalized:
             district_found = d
             break
     if not district_found:
-        mo = re.search(r"([А-ЯЁ][а-яё\-]+(?:\s[А-ЯЁ][а-яё]+)?ский)\s+район", text)
+        mo = re.search(r"([А-ЯЁ][а-яё\-]+(?:[\s\-][А-ЯЁ][а-яё]+)?ский)\s+район", text)
         if mo:
             district_found = mo.group(1)
     fields["district"] = district_found
@@ -176,7 +190,7 @@ def parse_fields(text: str):
     return fields
 
 
-# ---------- Query parsing (handles Russian + English/Uzbek transliteration) ----------
+# ---------- Free-text query parsing (quick search path) ----------
 def parse_query(text: str):
     text_lower = text.lower()
     criteria = {}
@@ -198,7 +212,6 @@ def parse_query(text: str):
                 val *= 1000
             criteria["max_price"] = val
 
-    # try longer aliases first (e.g. "mirzo ulugbek" before "mirzo")
     for alias in sorted(DISTRICT_ALIASES, key=len, reverse=True):
         if alias in text_lower:
             criteria["district"] = DISTRICT_ALIASES[alias]
@@ -217,11 +230,14 @@ def parse_query(text: str):
     return criteria
 
 
+# ---------- Core search ----------
 def search_listings(criteria, channel_id=None, limit=6):
+    """criteria keys: rooms, floor, total_floors, max_price, district (exact),
+    free_text (list of substrings), jk/orientir/sostoyanie (substrings)."""
     conn = get_conn()
     query = "SELECT * FROM listings WHERE 1=1"
     params = []
-    has_structured = False
+    has_any = False
 
     if channel_id is not None and channel_id != "ALL":
         query += " AND channel_id = ?"
@@ -229,27 +245,40 @@ def search_listings(criteria, channel_id=None, limit=6):
 
     if criteria.get("rooms") is not None:
         query += " AND rooms = ?"
-        params.append(criteria["rooms"])
-        has_structured = True
+        params.append(criteria["rooms"]); has_any = True
     if criteria.get("floor") is not None:
         query += " AND floor = ?"
-        params.append(criteria["floor"])
-        has_structured = True
+        params.append(criteria["floor"]); has_any = True
+    if criteria.get("total_floors") is not None:
+        query += " AND total_floors = ?"
+        params.append(criteria["total_floors"]); has_any = True
     if criteria.get("max_price") is not None:
         query += " AND price IS NOT NULL AND price <= ?"
-        params.append(criteria["max_price"])
-        has_structured = True
+        params.append(criteria["max_price"]); has_any = True
+    if criteria.get("max_area") is not None:
+        query += " AND area_m2 IS NOT NULL AND area_m2 <= ?"
+        params.append(criteria["max_area"]); has_any = True
     if criteria.get("district") is not None:
         query += " AND district = ?"
-        params.append(criteria["district"])
-        has_structured = True
+        params.append(criteria["district"]); has_any = True
 
-    free_text = criteria.get("free_text") or []
-    for word in free_text:
+    for key in ("free_text_extra",):
+        pass  # placeholder, substrings handled below
+
+    substring_fields = []
+    for word in criteria.get("free_text") or []:
+        substring_fields.append(word)
+    for key in ("jk", "orientir", "sostoyanie", "district_text"):
+        val = criteria.get(key)
+        if val:
+            substring_fields.append(val)
+
+    for word in substring_fields:
         query += " AND raw_text LIKE ? COLLATE NOCASE"
         params.append(f"%{word}%")
+        has_any = True
 
-    if not has_structured and not free_text:
+    if not has_any:
         conn.close()
         return []
 
@@ -276,7 +305,7 @@ def save_post(channel_id, message_id, date, text, photo_ids):
                 channel_id, message_id, fields.get("rooms"), fields.get("district"), len(photo_ids))
 
 
-# ---------- Handlers ----------
+# ---------- Telegram handlers ----------
 async def track_bot_added_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cmu = update.my_chat_member
     if not cmu:
@@ -331,6 +360,20 @@ def channel_picker_keyboard(channels):
     return InlineKeyboardMarkup(buttons)
 
 
+def field_menu_keyboard(user_id):
+    crit = user_search_criteria.get(user_id, {})
+    rows = []
+    for key, label in FIELD_LABELS.items():
+        val = crit.get(key)
+        text = f"{label}: {val}" if val else label
+        rows.append([InlineKeyboardButton(text, callback_data=f"field:{key}")])
+    rows.append([
+        InlineKeyboardButton("🔍 Искать", callback_data="search:go"),
+        InlineKeyboardButton("🔄 Сброс", callback_data="search:reset"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     channels = list_channels()
     if not channels:
@@ -349,7 +392,9 @@ async def handle_channel_choice(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":", 1)[1]
-    user_channel_choice[query.from_user.id] = choice if choice == "ALL" else int(choice)
+    user_id = query.from_user.id
+    user_channel_choice[user_id] = choice if choice == "ALL" else int(choice)
+    user_search_criteria[user_id] = {}
 
     if choice == "ALL":
         label = "все каналы"
@@ -361,13 +406,114 @@ async def handle_channel_choice(update: Update, context: ContextTypes.DEFAULT_TY
 
     await query.edit_message_text(
         f"Готово! Ищем в: {label}\n\n"
-        "Напишите запрос, например:\n"
-        "«Мирабад 2 комнаты 3 этаж» или «Mirabad 2 room 3 floor»"
+        "Можете написать запрос текстом (например «Мирабад 2 комнаты 3 этаж»), "
+        "или выбрать поля для точного поиска:",
     )
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text="Поиск по полям:",
+        reply_markup=field_menu_keyboard(user_id)
+    )
+
+
+async def handle_field_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    field = query.data.split(":", 1)[1]
+    user_id = query.from_user.id
+    user_awaiting_field[user_id] = field
+    label = FIELD_LABELS.get(field, field)
+    hint = " (число)" if field in NUMERIC_FIELDS else ""
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=f"Введите значение для «{label}»{hint}:"
+    )
+
+
+async def handle_search_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    user_id = query.from_user.id
+
+    if action == "reset":
+        user_search_criteria[user_id] = {}
+        await context.bot.send_message(
+            chat_id=query.message.chat_id, text="Критерии сброшены.",
+            reply_markup=field_menu_keyboard(user_id)
+        )
+        return
+
+    if action == "go":
+        crit = user_search_criteria.get(user_id, {})
+        criteria = {
+            "rooms": crit.get("komnata"),
+            "floor": crit.get("etaj"),
+            "total_floors": crit.get("etajnost"),
+            "max_price": crit.get("cena"),
+            "max_area": crit.get("ploshad"),
+        }
+        if crit.get("rayon"):
+            matched = None
+            rayon_lower = str(crit["rayon"]).lower()
+            for alias in sorted(DISTRICT_ALIASES, key=len, reverse=True):
+                if alias in rayon_lower:
+                    matched = DISTRICT_ALIASES[alias]
+                    break
+            if matched:
+                criteria["district"] = matched
+            else:
+                criteria["district_text"] = crit["rayon"]
+        if crit.get("jk"):
+            criteria["jk"] = crit["jk"]
+        if crit.get("orientir"):
+            criteria["orientir"] = crit["orientir"]
+        if crit.get("sostoyanie"):
+            criteria["sostoyanie"] = crit["sostoyanie"]
+
+        channel_id = user_channel_choice.get(user_id, "ALL")
+        matches = search_listings(criteria, channel_id=channel_id)
+        await send_results(context.bot, query.message.chat_id, matches)
+
+
+async def send_results(bot, chat_id, matches):
+    if not matches:
+        await bot.send_message(chat_id=chat_id, text="😕 Ничего не найдено по вашему запросу.")
+        return
+    await bot.send_message(chat_id=chat_id, text=f"Найдено {len(matches)} объект(ов):")
+    for l in matches:
+        photo_ids = l["photo_file_ids"].split(",") if l.get("photo_file_ids") else []
+        caption = l["raw_text"][:1024] if l["raw_text"] else None
+        if photo_ids:
+            if len(photo_ids) == 1:
+                await bot.send_photo(chat_id=chat_id, photo=photo_ids[0], caption=caption)
+            else:
+                from telegram import InputMediaPhoto
+                media = [InputMediaPhoto(pid, caption=caption if i == 0 else None)
+                         for i, pid in enumerate(photo_ids[:10])]
+                await bot.send_media_group(chat_id=chat_id, media=media)
+        else:
+            await bot.send_message(chat_id=chat_id, text=caption or "(без текста)")
 
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
+    text = update.message.text
+
+    # If we're mid-way through filling out a guided-search field, treat this as the value
+    if user_id in user_awaiting_field:
+        field = user_awaiting_field.pop(user_id)
+        value = text.strip()
+        if field in NUMERIC_FIELDS:
+            digits = re.sub(r"[^\d]", "", value)
+            value = int(digits) if digits else None
+        user_search_criteria.setdefault(user_id, {})[field] = value
+        await update.message.reply_text(
+            f"Записано: {FIELD_LABELS.get(field, field)} = {value}",
+            reply_markup=field_menu_keyboard(user_id)
+        )
+        return
+
     if user_id not in user_channel_choice:
         channels = list_channels()
         if not channels:
@@ -382,31 +528,22 @@ async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     channel_id = user_channel_choice[user_id]
-    text = update.message.text
     criteria = parse_query(text)
     matches = search_listings(criteria, channel_id=channel_id)
+    await send_results(context.bot, update.message.chat_id, matches)
 
-    if not matches:
-        await update.message.reply_text(
-            "😕 Ничего не найдено по вашему запросу. Попробуйте изменить критерии, "
-            "либо смените канал командой /start."
-        )
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    if user_id not in user_channel_choice:
+        channels = list_channels()
+        if not channels:
+            await update.message.reply_text("Бот пока не в каналах. Добавьте его администратором в канал.")
+            return
+        await update.message.reply_text("Сначала выберите канал:", reply_markup=channel_picker_keyboard(channels))
         return
-
-    await update.message.reply_text(f"Найдено {len(matches)} объект(ов):")
-    for l in matches:
-        photo_ids = l["photo_file_ids"].split(",") if l.get("photo_file_ids") else []
-        caption = l["raw_text"][:1024] if l["raw_text"] else None
-        if photo_ids:
-            if len(photo_ids) == 1:
-                await update.message.reply_photo(photo_ids[0], caption=caption)
-            else:
-                from telegram import InputMediaPhoto
-                media = [InputMediaPhoto(pid, caption=caption if i == 0 else None)
-                         for i, pid in enumerate(photo_ids[:10])]
-                await update.message.reply_media_group(media)
-        else:
-            await update.message.reply_text(caption or "(без текста)")
+    user_search_criteria.setdefault(user_id, {})
+    await update.message.reply_text("Поиск по полям:", reply_markup=field_menu_keyboard(user_id))
 
 
 def main():
@@ -419,9 +556,12 @@ def main():
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("search", search_command))
     app.add_handler(ChatMemberHandler(track_bot_added_to_channel, ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POST, handle_channel_post))
     app.add_handler(CallbackQueryHandler(handle_channel_choice, pattern=r"^ch:"))
+    app.add_handler(CallbackQueryHandler(handle_field_choice, pattern=r"^field:"))
+    app.add_handler(CallbackQueryHandler(handle_search_action, pattern=r"^search:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, handle_private_message))
 
     logger.info("Bot starting...")
