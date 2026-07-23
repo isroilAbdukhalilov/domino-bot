@@ -73,30 +73,46 @@ user_awaiting_field = {}          # user_id -> field name currently being entere
 pending_groups = {}               # (channel_id, media_group_id) -> {...}
 
 
-def transliterate(text: str) -> str:
-    """Translitterates Cyrillic text to Latin and vice-versa for flexible matching."""
+def normalize_text(text: str) -> str:
+    """Normalizes text for search: lowercase, Cyrillic-to-Latin, standardizes similar sounds, strips non-alphanumerics."""
+    if not text:
+        return ""
+    
+    text = text.lower()
+    
+    # Common transliteration & character equivalences
+    replacements = {
+        'ё': 'e', 'е': 'e', 'э': 'e',
+        'х': 'h', 'x': 'h', 'к': 'k', 'q': 'k',
+        'ў': 'o', 'о': 'o', 'а': 'a',
+        'в': 'v', 'w': 'v',
+        'ш': 'sh', 'ч': 'ch', 'ж': 'zh',
+        'ю': 'yu', 'я': 'ya', 'ы': 'y', 'и': 'i',
+        'c': 's', 'с': 's', 'm': 'm', 'м': 'm',
+        'p': 'r', 'р': 'r', 't': 't', 'т': 't',
+        'b': 'b', 'б': 'b', 'd': 'd', 'д': 'd',
+        'g': 'g', 'г': 'g', 'gh': 'g', 'ғ': 'g',
+        'l': 'l', 'л': 'l', 'n': 'n', 'н': 'n',
+        'z': 'z', 'з': 'z', 'f': 'f', 'ф': 'f'
+    }
+    
+    # Replace characters
     res = []
-    text_lower = text.lower()
-    i = 0
-    while i < len(text_lower):
-        matched = False
-        for lat_comb, cyr_val in LAT_TO_CYR.items():
-            if text_lower[i:i+len(lat_comb)] == lat_comb:
-                res.append(cyr_val)
-                i += len(lat_comb)
-                matched = True
-                break
-        if not matched:
-            char = text_lower[i]
-            res.append(CYR_TO_LAT.get(char, char))
-            i += 1
-    return "".join(res)
+    for char in text:
+        res.append(replacements.get(char, char))
+    
+    normalized = "".join(res)
+    # Strip spaces and punctuation so "Kox Ota" == "koxota" == "Кох Ота"
+    return re.sub(r"[^\w]", "", normalized)
 
 
 # ---------- Database ----------
 def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    # Register python normalization function into SQLite engine
+    conn.create_function("NORMALIZE", 1, normalize_text)
+    conn.create_function("SMART_SEARCH", 2, lambda text, query: normalize_text(query) in normalize_text(text))
     return conn
 
 
@@ -319,17 +335,15 @@ def search_listings(criteria, channel_id=None):
         query += " AND district = ?"
         params.append(criteria["district"])
 
-    # Multi-language / Transliterated Fuzzy Substring Matching
+    # Smart Multi-language & Fuzzy Text Matching
     words_to_match = list(criteria.get("free_text") or [])
     for key in ("jk", "orientir", "sostoyanie", "district_text"):
         if criteria.get(key):
             words_to_match.append(criteria[key])
 
     for word in words_to_match:
-        word_alt = transliterate(word)
-        query += " AND (raw_text LIKE ? OR raw_text LIKE ?) COLLATE NOCASE"
-        params.append(f"%{word}%")
-        params.append(f"%{word_alt}%")
+        query += " AND SMART_SEARCH(raw_text, ?) = 1"
+        params.append(word)
 
     query += " ORDER BY date DESC LIMIT ?"
     params.append(limit)
